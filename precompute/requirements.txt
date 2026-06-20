@@ -1,0 +1,8 @@
+sentence-transformers
+faiss-cpu
+rank-bm25
+scikit-learn
+numpy
+tqdm
+requests
+beautifulsoup4
