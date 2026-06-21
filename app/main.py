@@ -18,7 +18,6 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
-from sklearn.preprocessing import normalize as sk_normalize
 
 BASE_DIR      = Path(__file__).resolve().parent
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", BASE_DIR.parent / "artifacts"))
@@ -82,7 +81,8 @@ class SearchResponse(BaseModel):
 # ── Search logic ──────────────────────────────────────────────────────────────
 def faiss_search(query: str, top_k: int) -> dict:
     vec = state["model"].encode([query])
-    vec = sk_normalize(vec).astype(np.float32)
+    vec = vec / np.linalg.norm(vec, axis=1, keepdims=True)  # L2 normalize
+    vec = vec.astype(np.float32)
     scores, idxs = state["index"].search(vec, top_k)
     return {
         state["faiss_ids"][i]: float(s)

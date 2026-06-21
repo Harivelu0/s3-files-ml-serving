@@ -2,13 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install CPU-only torch first — prevents pulling CUDA build (~800MB → ~300MB)
+RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY templates/ templates/
 
-# Artifacts served from S3 Files mount — not baked into image
 ENV ARTIFACTS_DIR=/mnt/artifacts
 
 EXPOSE 8000

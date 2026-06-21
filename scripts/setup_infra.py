@@ -30,6 +30,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--region",  default="us-east-1")
 parser.add_argument("--name",    default="ml-serving")
 parser.add_argument("--image",   default="", help="ECR image URI for ECS task")
+parser.add_argument("--key",     default="ml-serving-key", help="EC2 key pair name")
 args = parser.parse_args()
 
 REGION      = args.region
@@ -79,6 +80,10 @@ def create_bucket():
                 "RestrictPublicBuckets": True,
             },
         )
+        s3.put_bucket_versioning(
+            Bucket=bucket_name,
+            VersioningConfiguration={"Status": "Enabled"},
+        )
         log("1/7", f"✓ Bucket: {bucket_name}")
     except ClientError as e:
         if e.response["Error"]["Code"] == "BucketAlreadyOwnedByYou":
@@ -95,21 +100,49 @@ def create_s3files_role(bucket_name):
     trust = {
         "Version": "2012-10-17",
         "Statement": [{
+            "Sid": "AllowS3FilesAssumeRole",
             "Effect": "Allow",
-            "Principal": {"Service": "s3files.amazonaws.com"},
+            "Principal": {"Service": "elasticfilesystem.amazonaws.com"},
             "Action": "sts:AssumeRole",
+            "Condition": {
+                "StringEquals": {"aws:SourceAccount": ACCOUNT_ID},
+                "ArnLike": {"aws:SourceArn": f"arn:aws:s3files:{REGION}:{ACCOUNT_ID}:file-system/*"},
+            },
         }],
     }
     policy = {
         "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"],
-            "Resource": [
-                f"arn:aws:s3:::{bucket_name}",
-                f"arn:aws:s3:::{bucket_name}/*",
-            ],
-        }],
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "s3:GetBucketNotification",
+                    "s3:PutBucketNotification",
+                    "s3:GetBucketVersioning",
+                ],
+                "Resource": [
+                    f"arn:aws:s3:::{bucket_name}",
+                    f"arn:aws:s3:::{bucket_name}/*",
+                ],
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "events:PutRule",
+                    "events:DeleteRule",
+                    "events:DescribeRule",
+                    "events:PutTargets",
+                    "events:RemoveTargets",
+                    "events:ListRules",
+                ],
+                "Resource": "*",
+            },
+        ],
     }
     try:
         role = iam.create_role(
@@ -138,13 +171,31 @@ def create_s3files_role(bucket_name):
 def create_file_system(bucket_name, role_arn):
     log("3/7", "Creating S3 File System...")
     bucket_arn = f"arn:aws:s3:::{bucket_name}"
-    fs = s3files.create_file_system(
-        Bucket=bucket_arn,
-        RoleArn=role_arn,
-    )
-    fs_id = fs["FileSystemId"]
+    try:
+        fs = s3files.create_file_system(
+            bucket=bucket_arn,
+            roleArn=role_arn,
+            acceptBucketWarning=True,
+        )
+        fs_id = fs.get("fileSystemId")
+    except Exception as e:
+        if "already exists" in str(e).lower() or "Conflict" in str(e):
+            fs = s3files.list_file_systems()
+            fs_id = fs.get("fileSystems", [{}])[0].get("fileSystemId")
+            log("3/7", f"✓ File System exists: {fs_id}")
+        else:
+            raise
     log("3/7", f"✓ File System: {fs_id}")
-    wait(30, "file system becoming available")
+
+    # Poll until available
+    print("  waiting for file system to become available...")
+    for _ in range(24):  # max 4 mins
+        resp   = s3files.get_file_system(fileSystemId=fs_id)
+        status = resp.get("status", "unknown")
+        print(f"  status: {status}")
+        if status == "available":
+            break
+        time.sleep(10)
     return fs_id
 
 
@@ -160,11 +211,12 @@ def get_default_vpc_subnet():
 def create_mount_target(fs_id, subnet_id, sg_id):
     log("4/7", "Creating Mount Target...")
     mt = s3files.create_mount_target(
-        FileSystemId=fs_id,
-        SubnetId=subnet_id,
-        SecurityGroups=[sg_id],
+        fileSystemId=fs_id,
+        subnetId=subnet_id,
+        securityGroups=[sg_id],
     )
-    mt_dns = mt["DNSName"]
+    mt_dns = f"{fs_id}.s3-files.{REGION}.amazonaws.com"
+    print(f"  DEBUG mt keys: {list(mt.keys())}")
     log("4/7", f"✓ Mount Target DNS: {mt_dns}")
     wait(60, "mount target becoming available")
     return mt_dns
@@ -231,13 +283,70 @@ def create_security_groups(vpc_id):
     except ClientError:
         pass
 
+    # Allow inbound 22 for SSH
+    try:
+        ec2.authorize_security_group_ingress(
+            GroupId=ec2_sg_id,
+            IpPermissions=[{
+                "IpProtocol": "tcp",
+                "FromPort": 22,
+                "ToPort": 22,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+            }],
+        )
+    except ClientError:
+        pass
+
     return nfs_sg_id, ec2_sg_id
 
 
 
 # ── Step 5: EC2 Instance ──────────────────────────────────────────────────────
+def create_ecs_instance_role():
+    role_name    = "ecsInstanceRole"
+    profile_name = "ecsInstanceRole"
+
+    # Create role if not exists
+    try:
+        iam.create_role(
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow",
+                    "Principal": {"Service": "ec2.amazonaws.com"},
+                    "Action": "sts:AssumeRole"}],
+            }),
+        )
+        iam.attach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role",
+        )
+        iam.attach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "EntityAlreadyExists":
+            raise
+
+    # Create instance profile if not exists
+    try:
+        iam.create_instance_profile(InstanceProfileName=profile_name)
+        iam.add_role_to_instance_profile(
+            InstanceProfileName=profile_name,
+            RoleName=role_name,
+        )
+        wait(10, "instance profile propagation")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "EntityAlreadyExists":
+            raise
+
+    return profile_name
+
+
 def create_ec2_instance(subnet_id, ec2_sg_id):
     log("5/7", "Launching EC2 instance (ECS-optimized AMI)...")
+    profile_name = create_ecs_instance_role()
 
     # ECS-optimized Amazon Linux 2 AMI (latest)
     ami = ec2.describe_images(
@@ -251,17 +360,19 @@ def create_ec2_instance(subnet_id, ec2_sg_id):
     ami_id = latest_ami["ImageId"]
 
     # IAM instance profile for ECS
-    instance_profile_arn = f"arn:aws:iam::{ACCOUNT_ID}:instance-profile/ecsInstanceRole"
-
     reservation = ec2.run_instances(
         ImageId=ami_id,
         InstanceType="t3.medium",
         MinCount=1,
         MaxCount=1,
-        SubnetId=subnet_id,
-        SecurityGroupIds=[ec2_sg_id],
-        IamInstanceProfile={"Arn": instance_profile_arn},
-        AssociatePublicIpAddress=True,
+        IamInstanceProfile={"Name": profile_name},
+        KeyName=args.key,
+        NetworkInterfaces=[{
+            "DeviceIndex": 0,
+            "SubnetId": subnet_id,
+            "Groups": [ec2_sg_id],
+            "AssociatePublicIpAddress": True,
+        }],
         UserData=f"""#!/bin/bash
 echo ECS_CLUSTER={NAME}-cluster >> /etc/ecs/ecs.config
 yum install -y nfs-utils
