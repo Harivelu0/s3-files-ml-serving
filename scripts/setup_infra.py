@@ -325,6 +325,10 @@ def create_ecs_instance_role():
             RoleName=role_name,
             PolicyArn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
         )
+        iam.attach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonS3FilesClientFullAccess",
+        )
     except ClientError as e:
         if e.response["Error"]["Code"] != "EntityAlreadyExists":
             raise
@@ -348,11 +352,11 @@ def create_ec2_instance(subnet_id, ec2_sg_id):
     log("5/7", "Launching EC2 instance (ECS-optimized AMI)...")
     profile_name = create_ecs_instance_role()
 
-    # ECS-optimized Amazon Linux 2 AMI (latest)
+    # Ubuntu 22.04 LTS AMI (latest)
     ami = ec2.describe_images(
-        Owners=["amazon"],
+        Owners=["099720109477"],  # Canonical
         Filters=[
-            {"Name": "name", "Values": ["amzn2-ami-ecs-hvm-*-x86_64-ebs"]},
+            {"Name": "name", "Values": ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]},
             {"Name": "state", "Values": ["available"]},
         ],
     )
@@ -373,10 +377,26 @@ def create_ec2_instance(subnet_id, ec2_sg_id):
             "Groups": [ec2_sg_id],
             "AssociatePublicIpAddress": True,
         }],
-        UserData=f"""#!/bin/bash
-echo ECS_CLUSTER={NAME}-cluster >> /etc/ecs/ecs.config
-yum install -y nfs-utils
+        UserData="""#!/bin/bash
+apt-get update -y
+apt-get install -y git nfs-common docker.io awscli
+
+# Start docker
+systemctl enable docker
+systemctl start docker
+usermod -aG docker ubuntu
+
+# ECS agent setup
+mkdir -p /etc/ecs
+echo "ECS_CLUSTER=ml-serving-cluster" >> /etc/ecs/ecs.config
+
+# Mount point for S3 Files
 mkdir -p /mnt/artifacts
+
+# Clone repo
+cd /home/ubuntu
+git clone https://github.com/Harivelu0/s3-files-ml-serving.git
+chown -R ubuntu:ubuntu s3-files-ml-serving
 """,
         TagSpecifications=[{
             "ResourceType": "instance",
@@ -440,13 +460,21 @@ def create_ecs_resources():
     task_arn = task["taskDefinition"]["taskDefinitionArn"]
 
     # ECS Service
-    ecs.create_service(
-        cluster=f"{NAME}-cluster",
-        serviceName=f"{NAME}-service",
-        taskDefinition=task_arn,
-        desiredCount=1,
-        launchType="EC2",
-    )
+    try:
+        ecs.create_service(
+            cluster=f"{NAME}-cluster",
+            serviceName=f"{NAME}-service",
+            taskDefinition=task_arn,
+            desiredCount=1,
+            launchType="EC2",
+        )
+    except ecs.exceptions.InvalidParameterException:
+        ecs.update_service(
+            cluster=f"{NAME}-cluster",
+            service=f"{NAME}-service",
+            taskDefinition=task_arn,
+            desiredCount=1,
+        )
     log("6/7", "✓ ECS cluster + task + service created")
 
 
